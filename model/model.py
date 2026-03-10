@@ -123,6 +123,8 @@ class FrameworkCfgModel(BaseModel):
     factor_col_limit: int = 32
     is_encrypt: bool = False
     is_simulate: Optional[str] = 'none'
+    lookback_days: int = 0
+    incremental_lookback_hours: int = 0
 
 
 class DeviceInfo(BaseModel):

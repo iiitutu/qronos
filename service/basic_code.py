@@ -1,6 +1,8 @@
 import ast
 import json
+import os
 import shutil
+import time as time_mod
 import traceback
 from datetime import datetime
 from enum import Enum
@@ -17,6 +19,37 @@ from utils.zip_utils import (
 )
 
 logger = get_logger()
+
+# ===== 账户统计缓存 =====
+_statistics_cache: Dict[tuple, dict] = {}
+_CACHE_TTL = 300  # 缓存过期时间（秒）
+
+
+def _collect_file_mtimes(account_json_path: Path, account_info_path: Path) -> dict:
+    """收集账户相关所有文件的修改时间，用于缓存失效判断"""
+    mtimes = {}
+    for file_path in [
+        account_json_path,
+        account_info_path / 'equity.pkl',
+        account_info_path / 'sub_stg_eqs.pkl',
+        account_info_path / 'pos_spot.pkl',
+        account_info_path / 'pos_swap.pkl',
+        account_info_path / 'pnl_history.pkl',
+    ]:
+        if file_path.exists():
+            mtimes[str(file_path)] = os.path.getmtime(file_path)
+    return mtimes
+
+
+def _is_cache_valid(cache_entry: dict, current_mtimes: dict) -> bool:
+    """校验缓存是否仍然有效"""
+    # 时间过期
+    if time_mod.time() - cache_entry['ts'] > _CACHE_TTL:
+        return False
+    # 文件变更
+    if cache_entry['mtimes'] != current_mtimes:
+        return False
+    return True
 
 
 def process_framework_account_statistics(framework_status, query_days: int) -> list:
@@ -63,8 +96,24 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
         try:
             # 读取账户配置
             account_json_path = account_path / f"{account_name}.json"
+
+            # 检查账户信息目录
+            account_info_path = data_path / account_name / '账户信息'
+            if not account_info_path.exists():
+                logger.warning(f'{account_name} 没有生成 [账户信息] 目录，该账户当前未下过单····')
+                continue
+
+            # ===== 缓存检查 =====
+            cache_key = (framework_status.framework_id, account_name, query_days)
+            current_mtimes = _collect_file_mtimes(account_json_path, account_info_path)
+            cached = _statistics_cache.get(cache_key)
+            if cached and _is_cache_valid(cached, current_mtimes):
+                result.append(cached['data'])
+                logger.debug(f"缓存命中: {account_name}")
+                continue
+
             account_json = json.loads(account_json_path.read_text(encoding='utf-8'))
-            
+
             # 基础账户信息
             account_info = {
                 'edit_id': framework_status.id,
@@ -76,13 +125,7 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                 'strategy_config': account_json['strategy_config'],
                 'strategy_pool': account_json['strategy_pool'],
             }
-            
-            # 检查账户信息目录
-            account_info_path = data_path / account_name / '账户信息'
-            if not account_info_path.exists():
-                logger.warning(f'{account_name} 没有生成 [账户信息] 目录，该账户当前未下过单····')
-                continue
-            
+
             # 处理资金曲线数据
             equity_start_time = None
             equity_path = account_info_path / 'equity.pkl'
@@ -110,7 +153,7 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                         # 格式化资金曲线数据
                         df['time'] = df['time'] + pd.to_timedelta(account_json['account_config']['hour_offset'])
                         df['time'] = df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-                        df['net'] = (df['净值'] - 1) * 100
+                        df['net'] = (100 * (df['净值'] / df['净值'].iloc[0] - 1)).round(2)
                         df['max2here'] = df['净值'].expanding().max()
                         df['dd2here'] = (df['净值'] / df['max2here'] - 1) * 100
                         df.rename(columns={
@@ -127,10 +170,10 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
 
                         df_dict = df[['time', *[col for col in cols if col in df.columns]]].to_dict('list')
                         account_info['equity'] = df_dict
-                    
+
                 except Exception as e:
                     logger.error(f"处理 {account_name} 资金曲线数据失败: {e}")
-            
+
             # 处理子策略资金曲线
             sub_stg_eqs_path = account_info_path / 'sub_stg_eqs.pkl'
             if sub_stg_eqs_path.exists() and equity_start_time:
@@ -147,32 +190,30 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
                             account_info['sub_stg_eqs'][stg_name] = df.loc[mask, ['candle_begin_time', 'net']].to_dict('list')
                 except Exception as e:
                     logger.error(f"处理 {account_name} 子策略资金曲线失败: {e}")
-            
-            # 处理现货持仓数据
+
+            # 处理现货持仓数据（只保留最新快照）
             pos_spot_path = account_info_path / 'pos_spot.pkl'
             if pos_spot_path.exists() and equity_start_time:
                 try:
                     pos_spot = pd.read_pickle(pos_spot_path)
                     if pos_spot:
-                        pos_spot_list = {}
-                        for timestamp_key, df in pos_spot.items():
-                            if not df.empty:
-                                pos_spot_list[timestamp_key] = df.reset_index().to_dict('records')
-                        account_info['pos_spot'] = pos_spot_list
+                        latest_key = max(pos_spot.keys())
+                        df = pos_spot[latest_key]
+                        if not df.empty:
+                            account_info['pos_spot'] = {latest_key: df.reset_index().to_dict('records')}
                 except Exception as e:
                     logger.error(f"处理 {account_name} 现货持仓数据失败: {e}")
-            
-            # 处理合约持仓数据
+
+            # 处理合约持仓数据（只保留最新快照）
             pos_swap_path = account_info_path / 'pos_swap.pkl'
             if pos_swap_path.exists() and equity_start_time:
                 try:
                     pos_swap = pd.read_pickle(pos_swap_path)
                     if pos_swap:
-                        pos_swap_list = {}
-                        for timestamp_key, df in pos_swap.items():
-                            if not df.empty:
-                                pos_swap_list[timestamp_key] = df.reset_index().to_dict('records')
-                        account_info['pos_swap'] = pos_swap_list
+                        latest_key = max(pos_swap.keys())
+                        df = pos_swap[latest_key]
+                        if not df.empty:
+                            account_info['pos_swap'] = {latest_key: df.reset_index().to_dict('records')}
                 except Exception as e:
                     logger.error(f"处理 {account_name} 合约持仓数据失败: {e}, {traceback.format_exc()}")
 
@@ -181,17 +222,28 @@ def process_framework_account_statistics(framework_status, query_days: int) -> l
             if pnl_history_path.exists() and equity_start_time:
                 try:
                     pnl_history = pd.read_pickle(pnl_history_path)
-                    account_info['pnl_history'] = pnl_history if pnl_history else {}
+                    if pnl_history:
+                        latest_key = max(pnl_history.keys())
+                        account_info['pnl_history'] = {latest_key: pnl_history[latest_key]}
+                    else:
+                        account_info['pnl_history'] = {}
                 except Exception as e:
                     logger.error(f"处理  {account_name} 持仓盈亏数据失败: {e}, {traceback.format_exc()}")
 
+            # ===== 写入缓存 =====
+            _statistics_cache[cache_key] = {
+                'data': account_info,
+                'mtimes': current_mtimes,
+                'ts': time_mod.time(),
+            }
+
             result.append(account_info)
             logger.debug(f"成功处理账户: {account_name}")
-            
+
         except Exception as e:
             logger.error(f"处理账户 {account_name} 统计信息失败: {e}")
             continue
-    
+
     logger.info(f"框架 {framework_status.framework_name} 处理完成，成功处理 {len(result)} 个账户")
     return result
 
@@ -1164,6 +1216,37 @@ def migrate_framework_data(raw_framework_status, target_framework_status):
                     'error': str(e)
                 })
         
+        # 迁移框架核心目录 (factors, positions, sections, signals)
+        migrated_framework_dirs = []
+        # 暂时移除这段功能，保持原有逻辑
+        # framework_dirs = ['factors', 'positions', 'sections', 'signals']
+        #
+        # for dir_name in framework_dirs:
+        #     source_dir = raw_framework_path / dir_name
+        #     if source_dir.exists() and source_dir.is_dir():
+        #         target_dir = target_framework_path / dir_name
+        #
+        #         try:
+        #             if target_dir.exists():
+        #                 shutil.rmtree(target_dir)
+        #
+        #             copied_files = copy_directory_with_filter(
+        #                 source_dir,
+        #                 target_dir,
+        #                 exclude_dirs=["__pycache__"]
+        #             )
+        #
+        #             if copied_files > 0:
+        #                 migrated_framework_dirs.append(dir_name)
+        #                 logger.info(f"已迁移框架目录: {dir_name} (文件数: {copied_files})")
+        #             else:
+        #                 logger.warning(f"框架目录 {dir_name} 没有有效文件，跳过迁移")
+        #
+        #         except Exception as e:
+        #             logger.error(f"迁移框架目录失败 {dir_name}: {e}")
+        #     else:
+        #         logger.debug(f"源框架目录不存在，跳过: {dir_name}")
+
         # 生成迁移报告
         migration_report = {
             'source_framework': {
@@ -1179,14 +1262,17 @@ def migrate_framework_data(raw_framework_status, target_framework_status):
             'migration_summary': {
                 'total_accounts': len(json_files),
                 'migrated_successfully': len(migrated_users),
-                'failed_migrations': len(failed_users)
+                'failed_migrations': len(failed_users),
+                'migrated_framework_dirs': migrated_framework_dirs
             },
             'migrated_accounts': migrated_users,
             'failed_accounts': failed_users
         }
-        
+
         logger.info(f"数据迁移完成: 成功迁移 {len(migrated_users)} 个账户，失败 {len(failed_users)} 个账户")
-        
+        if migrated_framework_dirs:
+            logger.info(f"已迁移框架目录: {migrated_framework_dirs}")
+
         success = len(failed_users) == 0
         error_msg = None if success else f"有 {len(failed_users)} 个账户迁移失败"
         

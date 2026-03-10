@@ -50,6 +50,7 @@ from fastapi import (
     FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
 )
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import FileResponse
 
 from config import MAX_DEVICES_PER_USER
@@ -92,6 +93,9 @@ app = FastAPI(
     description="提供量化交易框架的完整管理功能，包括用户认证、框架下载、配置管理等",
     version="0.0.1"
 )
+
+# 配置GZip压缩中间件 - 响应体超过1024字节自动压缩
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # 配置认证中间件 - 统一处理JWT token验证和刷新
 app.add_middleware(AuthMiddleware)

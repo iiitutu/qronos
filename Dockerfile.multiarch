@@ -174,6 +174,8 @@ RUN mkdir -p /usr/share/fonts/SourceHanSans \
 FROM web-layer AS python-build
 
 # 安装 Python 编译依赖（带重试机制）
+# 先删除Chrome源配置，避免GPG密钥验证问题
+RUN rm -f /etc/apt/sources.list.d/google-chrome.list 2>/dev/null || true
 RUN for i in 1 2 3; do \
         apt-get update && apt-get install -y --no-install-recommends \
             gcc \
@@ -183,13 +185,44 @@ RUN for i in 1 2 3; do \
             && break || sleep 10; \
     done
 
-# 配置 pip 镜像源
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+# 配置 pip 镜像源（多源回退机制）
+RUN { \
+    # 尝试清华源
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn; \
+    } || { \
+    # 回退到阿里云源
+    pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip config set global.trusted-host mirrors.aliyun.com; \
+    } || { \
+    # 回退到腾讯云源
+    pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple/ && \
+    pip config set global.trusted-host mirrors.cloud.tencent.com; \
+    } || { \
+    # 最后回退到官方源
+    pip config set global.index-url https://pypi.org/simple; \
+    }
 
-# 复制并安装 Python 依赖（单独层，便于缓存）
+# 复制并安装 Python 依赖（单独层，便于缓存，带多源重试）
 COPY requirements.txt /tmp/
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN for i in 1 2 3; do \
+        echo "尝试安装 Python 依赖，第 $i 次..." && \
+        pip install --no-cache-dir -r /tmp/requirements.txt && \
+        echo "Python 依赖安装成功" && break || \
+        { \
+            echo "依赖安装失败，尝试切换源..."; \
+            if [ $i -eq 1 ]; then \
+                echo "切换到阿里云源" && \
+                pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+                pip config set global.trusted-host mirrors.aliyun.com; \
+            elif [ $i -eq 2 ]; then \
+                echo "切换到官方源" && \
+                pip config set global.index-url https://pypi.org/simple && \
+                pip config unset global.trusted-host; \
+            fi; \
+            sleep 5; \
+        }; \
+    done \
     && rm /tmp/requirements.txt
 
 # ============================================================================
@@ -197,12 +230,36 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # ============================================================================
 FROM python-build AS alpha-env
 
-# 创建量化交易框架专用环境
+# 创建量化交易框架专用环境（带多源回退）
 RUN python -m venv /opt/alpha_env \
-    && /opt/alpha_env/bin/pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    && /opt/alpha_env/bin/pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn \
-    && /opt/alpha_env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/alpha_env/bin/pip install --no-cache-dir xbx-py11
+    && { \
+        /opt/alpha_env/bin/pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+        /opt/alpha_env/bin/pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn; \
+    } || { \
+        /opt/alpha_env/bin/pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+        /opt/alpha_env/bin/pip config set global.trusted-host mirrors.aliyun.com; \
+    } || { \
+        /opt/alpha_env/bin/pip config set global.index-url https://pypi.org/simple; \
+    } \
+    && for i in 1 2 3; do \
+        echo "尝试安装 alpha_env 依赖，第 $i 次..." && \
+        /opt/alpha_env/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+        /opt/alpha_env/bin/pip install --no-cache-dir xbx-py11 && \
+        echo "alpha_env 依赖安装成功" && break || \
+        { \
+            echo "依赖安装失败，尝试切换源..."; \
+            if [ $i -eq 1 ]; then \
+                echo "切换到阿里云源" && \
+                /opt/alpha_env/bin/pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+                /opt/alpha_env/bin/pip config set global.trusted-host mirrors.aliyun.com; \
+            elif [ $i -eq 2 ]; then \
+                echo "切换到官方源" && \
+                /opt/alpha_env/bin/pip config set global.index-url https://pypi.org/simple && \
+                /opt/alpha_env/bin/pip config unset global.trusted-host; \
+            fi; \
+            sleep 5; \
+        }; \
+    done
 
 # ============================================================================
 # 阶段5: 最终运行时镜像（不包含编译工具）

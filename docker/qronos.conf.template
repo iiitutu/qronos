@@ -36,10 +36,11 @@ server {
         
         # 缓冲设置
         proxy_buffering on;
-        proxy_buffer_size 4k;
-        proxy_buffers 8 4k;
+        proxy_buffer_size 32k;
+        proxy_buffers 16 32k;
+        proxy_busy_buffers_size 64k;
     }
-    
+
     # 外部API代理 - 使用动态前缀路径
     # 使用路径：/${API_PREFIX}/api/
     location /${API_PREFIX}/api/ {
